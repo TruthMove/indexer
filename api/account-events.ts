@@ -1,11 +1,21 @@
 import { streamTransactions } from "../index";
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import Pusher from 'pusher';
 
 // Configuration
 const STARTING_VERSION = Number(process.env.STARTING_VERSION || "0");
 const MODULE_ADDRESS = process.env.MODULE_ADDRESS || "0xf57ffdaa57e13bc27ac9b46663749a5d03a846ada4007dfdf1483d482b48dace";
 const MAX_RETRIES = 5;
 const RETRY_DELAY = 5000; // 5 seconds
+
+// Initialize Pusher
+const pusher = new Pusher({
+  appId: process.env.PUSHER_APP_ID!,
+  key: process.env.PUSHER_KEY!,
+  secret: process.env.PUSHER_SECRET!,
+  cluster: process.env.PUSHER_CLUSTER!,
+  useTLS: true
+});
 
 // Helper function to check if an event is related to our target account
 function isAccountRelatedEvent(event: any): boolean {
@@ -35,20 +45,9 @@ function isAccountRelatedEvent(event: any): boolean {
 }
 
 // Main processing loop with retry logic
-async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVersion = STARTING_VERSION) {
+async function streamLiveEvents(retryCount = 0, currentVersion = STARTING_VERSION) {
   try {
     console.log(`Starting stream from version ${currentVersion} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-    
-    // Set SSE headers
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-    });
-
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: "connection_status", status: "connected", timestamp: Date.now() })}\n\n`);
     
     for await (const event of streamTransactions({
       url: "grpc.testnet.aptoslabs.com:443",
@@ -75,8 +74,8 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
               if (isAccountRelatedEvent(evt)) {
                 console.log({ evt });
 
-                // Send event to client
-                res.write(`data: ${JSON.stringify({
+                // Send event through Pusher
+                await pusher.trigger('aptos-events', 'account-event', {
                   type: "account_event",
                   data: {
                     version,
@@ -84,7 +83,7 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
                     event_data: JSON.parse(evt.data),
                     timestamp,
                   },
-                })}\n\n`);
+                });
               }
             }
           }
@@ -94,7 +93,7 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
           console.error("Stream error:", event.error);
           if (event.error.code === 14 && event.error.details === "Connection dropped") {
             console.log(`Connection dropped, restarting from version ${currentVersion}`);
-            return await streamLiveEvents(res, 0, currentVersion);
+            return await streamLiveEvents(0, currentVersion);
           }
         }
         case "metadata": {
@@ -105,11 +104,11 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
             console.error(`Stream status error: ${event.status.code} - ${event.status.details}`);
             if (event.status.code === 13 && event.status.details.includes("invalid wire type")) {
               console.log(`Encountered wire type error, incrementing version from ${currentVersion} to ${currentVersion + 1}`);
-              return await streamLiveEvents(res, 0, currentVersion + 1);
+              return await streamLiveEvents(0, currentVersion + 1);
             }
             if (event.status.code === 14 && event.status.details === "Connection dropped") {
               console.log(`Connection dropped, restarting from version ${currentVersion}`);
-              return await streamLiveEvents(res, 0, currentVersion);
+              return await streamLiveEvents(0, currentVersion);
             }
           }
           break;
@@ -122,10 +121,9 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
     if (retryCount < MAX_RETRIES) {
       console.log(`Retrying in ${RETRY_DELAY/1000} seconds... (${retryCount + 1}/${MAX_RETRIES})`);
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-      return await streamLiveEvents(res, retryCount + 1, currentVersion);
+      return await streamLiveEvents(retryCount + 1, currentVersion);
     } else {
       console.error("Max retries reached. Please check your connection and API key.");
-      res.end();
     }
   }
 }
@@ -145,7 +143,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   if (req.method === 'GET') {
-    await streamLiveEvents(res);
+    // Start the event stream
+    streamLiveEvents().catch(console.error);
+    
+    // Return Pusher configuration
+    res.json({
+      pusherKey: process.env.PUSHER_KEY,
+      pusherCluster: process.env.PUSHER_CLUSTER,
+    });
   } else {
     res.status(405).json({ error: 'Method not allowed' });
   }

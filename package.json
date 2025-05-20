@@ -10,6 +10,8 @@
     "@aptos-labs/aptos-protos": "^1.1.3",
     "@grpc/grpc-js": "^1.12.6",
     "@vercel/node": "^5.1.16",
+    "pusher": "^5.2.0",
+    "pusher-js": "^8.4.0",
     "ws": "^8.16.0"
   },
   "devDependencies": {
