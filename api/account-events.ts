@@ -1,26 +1,15 @@
-/**
- * Live Account Event Streamer for Vercel
- * 
- * Features:
- * - Streams live events related to a specific account using gRPC
- * - Emits events via Server-Sent Events (SSE) in real-time
- * - Robust gRPC connection handling with automatic reconnection
- * - Security features for production deployment
- * 
- * Requirements:
- * - An Aptos API key (get one from https://aptoslabs.com/developers)
- * - Set the API key in environment variable APTOS_API_KEY_TESTNET
- * - Vercel deployment
- */
-
-import { streamTransactions } from ".";
+import { streamTransactions } from "../index";
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import { WebSocket, WebSocketServer } from 'ws';
 
 // Configuration
 const STARTING_VERSION = Number(process.env.STARTING_VERSION || "0");
 const MODULE_ADDRESS = process.env.MODULE_ADDRESS || "0xf57ffdaa57e13bc27ac9b46663749a5d03a846ada4007dfdf1483d482b48dace";
 const MAX_RETRIES = 5;
 const RETRY_DELAY = 5000; // 5 seconds
+
+// WebSocket server instance
+let wss: WebSocketServer | null = null;
 
 // Helper function to check if an event is related to our target account
 function isAccountRelatedEvent(event: any): boolean {
@@ -50,20 +39,9 @@ function isAccountRelatedEvent(event: any): boolean {
 }
 
 // Main processing loop with retry logic
-async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVersion = STARTING_VERSION) {
+async function streamLiveEvents(retryCount = 0, currentVersion = STARTING_VERSION) {
   try {
     console.log(`Starting stream from version ${currentVersion} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-    
-    // Set SSE headers
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'Access-Control-Allow-Origin': '*',
-    });
-
-    // Send initial connection message
-    res.write(`data: ${JSON.stringify({ type: "connection_status", status: "connected", timestamp: Date.now() })}\n\n`);
     
     for await (const event of streamTransactions({
       url: "grpc.testnet.aptoslabs.com:443",
@@ -90,16 +68,24 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
               if (isAccountRelatedEvent(evt)) {
                 console.log({ evt });
 
-                // Send event to client
-                res.write(`data: ${JSON.stringify({
-                  type: "account_event",
-                  data: {
-                    version,
-                    event_type: evt.typeStr,
-                    event_data: JSON.parse(evt.data),
-                    timestamp,
-                  },
-                })}\n\n`);
+                // Broadcast event to all connected WebSocket clients
+                if (wss) {
+                  const message = JSON.stringify({
+                    type: "account_event",
+                    data: {
+                      version,
+                      event_type: evt.typeStr,
+                      event_data: JSON.parse(evt.data),
+                      timestamp,
+                    },
+                  });
+
+                  wss.clients.forEach((client: WebSocket) => {
+                    if (client.readyState === WebSocket.OPEN) {
+                      client.send(message);
+                    }
+                  });
+                }
               }
             }
           }
@@ -107,10 +93,9 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
         }
         case "error": {
           console.error("Stream error:", event.error);
-          // Check for connection drop
           if (event.error.code === 14 && event.error.details === "Connection dropped") {
             console.log(`Connection dropped, restarting from version ${currentVersion}`);
-            return await streamLiveEvents(res, 0, currentVersion);
+            return await streamLiveEvents(0, currentVersion);
           }
         }
         case "metadata": {
@@ -119,15 +104,13 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
         case "status": {
           if (event.status.code !== 0) {
             console.error(`Stream status error: ${event.status.code} - ${event.status.details}`);
-            // Check for wire type error
             if (event.status.code === 13 && event.status.details.includes("invalid wire type")) {
               console.log(`Encountered wire type error, incrementing version from ${currentVersion} to ${currentVersion + 1}`);
-              return await streamLiveEvents(res, 0, currentVersion + 1);
+              return await streamLiveEvents(0, currentVersion + 1);
             }
-            // Check for connection drop
             if (event.status.code === 14 && event.status.details === "Connection dropped") {
               console.log(`Connection dropped, restarting from version ${currentVersion}`);
-              return await streamLiveEvents(res, 0, currentVersion);
+              return await streamLiveEvents(0, currentVersion);
             }
           }
           break;
@@ -140,18 +123,44 @@ async function streamLiveEvents(res: VercelResponse, retryCount = 0, currentVers
     if (retryCount < MAX_RETRIES) {
       console.log(`Retrying in ${RETRY_DELAY/1000} seconds... (${retryCount + 1}/${MAX_RETRIES})`);
       await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY));
-      return await streamLiveEvents(res, retryCount + 1, currentVersion);
+      return await streamLiveEvents(retryCount + 1, currentVersion);
     } else {
       console.error("Max retries reached. Please check your connection and API key.");
-      res.end();
     }
   }
 }
 
-// Vercel serverless function handler
+// Vercel serverless function handler for WebSocket upgrade
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method === 'GET') {
-    await streamLiveEvents(res);
+    // Initialize WebSocket server if not already initialized
+    if (!wss) {
+      wss = new WebSocketServer({ noServer: true });
+      
+      wss.on('connection', (ws: WebSocket) => {
+        console.log('New WebSocket connection');
+        
+        ws.on('close', () => {
+          console.log('Client disconnected');
+        });
+      });
+
+      // Start the event stream
+      streamLiveEvents().catch(console.error);
+    }
+
+    // Handle WebSocket upgrade
+    if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
+      if (!wss) {
+        res.status(500).json({ error: 'WebSocket server not initialized' });
+        return;
+      }
+      wss.handleUpgrade(req, req.socket, Buffer.alloc(0), (ws: WebSocket) => {
+        wss?.emit('connection', ws, req);
+      });
+    } else {
+      res.status(400).json({ error: 'WebSocket upgrade required' });
+    }
   } else {
     res.status(405).json({ error: 'Method not allowed' });
   }
